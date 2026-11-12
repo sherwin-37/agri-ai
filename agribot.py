@@ -2,9 +2,11 @@ import html
 import os
 from pathlib import Path
 
+import speech_recognition as sr
 import streamlit as st
 from openai import APIError, OpenAI, RateLimitError
 from pdf_knowledge import load_pdf_chunks, retrieve_relevant_chunks
+from streamlit_mic_recorder import mic_recorder
 
 # ---------------- Page setup ----------------
 st.set_page_config(page_title="AGRI-AI", page_icon="🌾")
@@ -380,7 +382,46 @@ for msg in st.session_state.messages:
         with st.chat_message("assistant"):
             st.markdown(msg["content"])
 
+st.caption(
+    "Voice recognition sends audio to Google's speech service; the transcript is sent to DeepSeek."
+)
+voice_language = st.selectbox(
+    "Voice input language",
+    ("English", "Tamil"),
+    key="voice_input_language",
+)
+voice_recording = mic_recorder(
+    start_prompt="🎙️ Record a question",
+    stop_prompt="⏹️ Stop recording",
+    just_once=True,
+    use_container_width=True,
+    format="wav",
+    key="agri_voice_input",
+)
+
+voice_input = None
+if voice_recording:
+    recognizer = sr.Recognizer()
+    recognizer.operation_timeout = 15
+    audio_data = sr.AudioData(
+        voice_recording["bytes"],
+        voice_recording["sample_rate"],
+        voice_recording["sample_width"],
+    )
+    with st.spinner("Transcribing your question..."):
+        try:
+            voice_input = recognizer.recognize_google(
+                audio_data,
+                language={"English": "en-US", "Tamil": "ta-IN"}[voice_language],
+            )
+        except sr.UnknownValueError:
+            st.warning("I couldn't understand that recording. Please try again.")
+        except sr.RequestError as error:
+            st.error(f"Speech recognition is unavailable: {error}")
+
 user_input = st.chat_input("Ask your farming question...")
+if not user_input:
+    user_input = voice_input
 
 if user_input:
     st.session_state.messages.append({"role": "user", "content": user_input})
