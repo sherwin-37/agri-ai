@@ -1,11 +1,14 @@
 """AGRI-AI • school exhibition dashboard
 Run: python -m streamlit run agribot.py
+Install streamlit>=1.51 and pyserial. Run locally for USB.
 Required: Streamlit 1.51 or newer for browser voice controls. For PDF support
 restore pdf_knowledge.py with its dependencies, or install pypdf. Put
 agri_data_base.pdf beside this file. Configure DEEPSEEK_API_KEY in Streamlit
 secrets or the environment. The exhibition model image is embedded at the end.
 """
 import json
+import math
+import time
 import os
 from pathlib import Path
 import re
@@ -23,7 +26,7 @@ LOW_TANK = 20  # Exhibition setting, in simulated percentage points.
 READINGS = {
     "temperature": ("Air temperature", "°C", -5, 55, 28, "#f2ac62", "DHT11 · air"),
     "humidity": ("Air humidity", "%", 0, 100, 64, "#69cbea", "DHT11 · relative humidity"),
-    "soil": ("Soil moisture", "%", 0, 100, 42, "#b3df75", "Capacitive probe · demo scale"),
+    "soil": ("Soil moisture", "%", 0, 100, 42, "#b3df75", "Soil probe · demo scale"),
     "tank": ("Tank water level", "%", 0, 100, 70, "#91a8ff", "Reservoir · demo scale"),
 }
 SPEECH_LANGS = {"English": "en-IN", "தமிழ்": "ta-IN", "हिन्दी": "hi-IN"}
@@ -64,12 +67,17 @@ welcome_message = (
 )
 
 SENSOR_INSTRUCTION = """
-All dashboard measurements in this edition are manually simulated for a school
-exhibition. Explicitly identify them as demo values when using them. Tank level
-is stored irrigation water, not soil moisture. Soil moisture is a relative demo
-scale. Never infer pH, EC, soil nutrients, crop disease, or a real farm's
-condition from these sliders. For a crop choice, consider season, region, soil,
-drainage and climate over time. Ask for missing context and identify assumptions.
+Use the current request's source field to distinguish manual demo data from
+live Arduino USB readings. Historical chat may refer to different sources or
+older values. Use only the current snapshot for current sensor claims.
+Null or unavailable means no fresh measurement. Do not invent missing values.
+Soil and rain are uncalibrated raw ADC values, not moisture percentages.
+The user confirms probe presence; software cannot detect detached analog probes.
+Rain-plate wetness cannot give rainfall quantity or tank level. Tank level is
+unavailable in the current physical model. DHT11 measures air, not soil temperature.
+Do not infer pH, EC, nutrients, disease or irrigation needs from raw readings.
+Crop suggestions need region, season, soil, drainage and climate over time.
+Ask for missing information. Explain assumptions and avoid suitability guarantees.
 You may answer general farming questions from general knowledge. Distinguish
 general guidance from textbook evidence, and cite PDF pages only when provided.
 """
@@ -193,28 +201,42 @@ def crop_example(values, soil_type):
 
 
 def reading_summary(values):
-    return ", ".join(f"{meta[0]} {values[key]}{meta[1]}" for key, meta in READINGS.items())
+    definitions = LIVE_READINGS if using_live() else READINGS
+    parts = []
+    for key, meta in definitions.items():
+        value = values.get(key)
+        text = "unavailable" if value is None else f"{value}{meta[1]}"
+        parts.append(f"{meta[0]} {text}")
+    if using_live():
+        parts.append("Tank level unavailable")
+    return ", ".join(parts)
 
 
 def demo_reply(question, values, soil_type):
+    # Local replies can report live readings without an API key.
+    if using_live():
+        text = "Live USB readings: " + reading_summary(values) + "."
+        if not any(value is not None for value in values.values()):
+            text = "No fresh sensor readings are available. Connect Arduino and check the USB messages."
+        return text + " For a farming explanation or crop recommendation, configure the DeepSeek key."
     terms = question.casefold()
-    if any(s in terms for s in ("crop", "grow", "plant", "பயிர", "फसल")):
+    if any(word in terms for word in ("crop", "grow", "plant", "பயிர", "फसल")):
         crop, detail, _ = crop_example(values, soil_type)
         return f"Demo crop example: {crop}. {detail}"
-    if any(s in terms for s in ("tank", "reservoir", "water level", "refill", "தொட்டி", "टंकी")):
+    if any(word in terms for word in ("tank", "reservoir", "water level", "refill", "தொட்டி", "टंकी")):
         action = "Please refill the tank." if values["tank"] < LOW_TANK else "The level is above or at the refill mark."
         return f"The simulated tank is at {values['tank']}%. {action} The demo refill warning starts below {LOW_TANK}%."
-    if any(s in terms for s in ("reading", "sensor", "humid", "soil", "temp", "moisture", "நிலை", "तापमान")):
+    if any(word in terms for word in ("reading", "sensor", "humid", "soil", "temp", "moisture", "நிலை", "तापमान")):
         return "Current simulated readings: " + reading_summary(values) + "."
     return "Local demo answers cover the readings, tank level and crop examples. For an open farming question, configure DEEPSEEK_API_KEY in Streamlit secrets."
 
 
 def generate_reply(question, history, values, farm, key):
     if not key:
-        return demo_reply(question, values, farm["soil type"]), "Local demo"
+        return demo_reply(question, values, farm["soil type"]), "Local sensor summary" if using_live() else "Local demo"
     passages, note = textbook_context(question, history)
-    context = {"source": "school simulator; hardware disconnected", "readings": reading_summary(values),
-               "tank refill alert below (%)": LOW_TANK, "farm details supplied by user": farm}
+    context = sensor_context(values)
+    context["farm details supplied by user"] = farm
     messages = [{"role": "system", "content": system_instruction + SENSOR_INSTRUCTION}]
     messages.extend({"role": m["role"], "content": m["content"]} for m in history[-3:])
     messages.append({"role": "user", "content":
@@ -239,7 +261,7 @@ def generate_reply(question, history, values, farm, key):
         issue = f"DeepSeek returned HTTP {code}. {hints.get(code, 'Please try again later.')}"
     except (requests.RequestException, ValueError, KeyError, IndexError, TypeError):
         issue = "DeepSeek was unavailable or returned an empty reply."
-    return demo_reply(question, values, farm["soil type"]), issue + " Showing a local demo answer."
+    return demo_reply(question, values, farm["soil type"]), issue + " Showing a basic local answer."
 
 
 def start_chat():
@@ -292,13 +314,16 @@ def init_state():
             s[name] = default
 
 
-def metric_cards(values):
+def metric_cards(values, definitions=None):
+    definitions = definitions or READINGS
     cards = []
-    for key, (label, unit, lo, hi, _, color, caption) in READINGS.items():
-        value = values[key]
-        pct = round(100 * (value - lo) / (hi - lo))
+    for key, (label, unit, lo, hi, _, color, caption) in definitions.items():
+        value = values.get(key)
+        pct = 0 if value is None else max(0, min(100, round(100 * (value - lo) / (hi - lo))))
+        text = "—" if value is None else f"{value:g}"
+        suffix = "" if value is None else unit
         cards.append(f'<article class="ag-metric"><div class="ag-label">{label}</div>'
-                     f'<div class="ag-value">{value}<span class="ag-unit">{unit}</span></div>'
+                     f'<div class="ag-value">{text}<span class="ag-unit">{suffix}</span></div>'
                      f'<div class="ag-meter"><i style="width:{pct}%;background:{color}"></i></div>'
                      f'<div class="ag-foot">{caption}</div></article>')
     st.markdown('<div class="ag-metrics">' + "".join(cards) + "</div>", unsafe_allow_html=True)
@@ -403,7 +428,7 @@ def handle_question(question, farm, key):
     if history and history[0]["content"] == welcome_message:
         history = history[1:]
     with st.spinner("Preparing your reply…"):
-        answer, source = generate_reply(question, history, state.demo, farm, key)
+        answer, source = generate_reply(question, history, current_values(), farm, key)
     state.messages.extend([{"role": "user", "content": question}, {"role": "assistant", "content": answer, "source": source}])
     state.last_answer = answer
     state.reply_id = uuid4().hex
@@ -528,6 +553,226 @@ def render_voice(allow_mic):
 
 
 
+# ---------------- USB sensor connection ----------------
+LIVE_READINGS = {
+    "temperature": ("Air temperature", "°C", -5, 55, 0, "#f2ac62", "DHT11"),
+    "humidity": ("Air humidity", "%", 0, 100, 0, "#69cbea", "DHT11"),
+    "soil": ("Soil probe", "raw", 0, 1023, 0, "#b3df75", "Calibration pending"),
+    "rain": ("Rain plate", "raw", 0, 1023, 0, "#91a8ff", "Surface wetness · calibration pending"),
+}
+
+try:
+    import serial
+    from serial.tools import list_ports
+except ImportError:
+    serial = None
+
+
+class UsbReadings:
+    """A session-owned connection, polled by the live fragment without threads."""
+    def __init__(self, port):
+        self.connection = serial.Serial(port, 9600, timeout=0)
+        self.port = port
+        self.buffer = b""
+        self.packet = None
+        self.received_at = None
+        self.received_clock = None
+        self.sequence = 0
+        self.error = ""
+        self.started_clock = time.monotonic()
+
+    def close(self):
+        self.connection.close()
+        self.packet = None
+        self.buffer = b""
+
+    def poll(self):
+        if self.error or not self.connection.is_open:
+            return
+        try:
+            count = min(self.connection.in_waiting, 65536)
+            if not count:
+                return
+            self.buffer += self.connection.read(count)
+            lines = self.buffer.split(b"\n")
+            self.buffer = lines.pop()
+            if len(self.buffer) > 4096:
+                self.buffer = b""
+            for line in lines:
+                if len(line) > 4096:
+                    continue
+                try:
+                    packet = validate_packet(json.loads(line))
+                except (ValueError, UnicodeError, TypeError):
+                    continue
+                if packet is None:
+                    continue
+                self.packet = packet
+                self.received_clock = time.monotonic()
+                self.received_at = now_utc()
+                self.sequence += 1
+        except (serial.SerialException, OSError):
+            self.error = "USB disconnected or unavailable. Disconnect here, check the cable and port, then reconnect."
+            self.connection.close()
+
+
+def validate_packet(packet):
+    if not isinstance(packet, dict) or packet.get("schema") != "agri-ai-v1":
+        return None
+    raw_fields = ("soil_raw", "rain_raw")
+    for field in raw_fields:
+        value = packet.get(field)
+        if type(value) is not int or not 0 <= value <= 1023:
+            return None
+    for field, low, high in (("temperature_c", -40, 80), ("humidity_pct", 0, 100)):
+        value = packet.get(field)
+        if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or not low <= value <= high):
+            return None
+    if type(packet.get("dht_ok")) is not bool or type(packet.get("lcd_ok")) is not bool:
+        return None
+    return {field: packet.get(field) for field in
+            ("schema", "uptime_ms", "temperature_c", "humidity_pct",
+             "soil_raw", "rain_raw", "dht_ok", "lcd_ok")}
+
+
+def using_live():
+    return st.session_state.get("data_source", "Live USB") == "Live USB" and st.session_state.get("workspace") != "Farm simulator"
+
+
+def current_values():
+    s = st.session_state
+    if not using_live():
+        return s.demo.copy()
+    values = {"temperature": None, "humidity": None, "soil": None, "rain": None, "tank": None}
+    reader = s.get("usb_reader")
+    if reader is None:
+        return values
+    reader.poll()
+    if reader.error or reader.received_clock is None or time.monotonic() - reader.received_clock > 10:
+        return values
+    packet = reader.packet
+    if packet["dht_ok"]:
+        values["temperature"] = packet["temperature_c"]
+        values["humidity"] = packet["humidity_pct"]
+    if s.get("soil_attached", False):
+        values["soil"] = packet["soil_raw"]
+    if s.get("rain_attached", False):
+        values["rain"] = packet["rain_raw"]
+    return values
+
+
+def sensor_context(values):
+    if not using_live():
+        return {"source": "manual demo", "readings": reading_summary(values),
+                "demo tank refill mark (%)": LOW_TANK}
+    reader = st.session_state.get("usb_reader")
+    return {"source": "Arduino Uno USB", "port": reader.port if reader else None,
+            "last received (UTC)": reader.received_at if reader else None,
+            "readings": reading_summary(values),
+            "soil probe attached (user confirmation)": st.session_state.get("soil_attached", False),
+            "rain plate attached (user confirmation)": st.session_state.get("rain_attached", False),
+            "tank level": "unavailable; no tank level sensor",
+            "soil and rain raw limits": "0 to 1023; uncalibrated; not a percentage",
+            "fresh": any(value is not None for value in values.values())}
+
+
+def usb_controls():
+    s = st.session_state
+    st.selectbox("Data source", ["Live USB", "Demo"], key="data_source")
+    if s.data_source != "Live USB":
+        reader = s.pop("usb_reader", None)
+        if reader is not None:
+            reader.close()
+        return
+    st.caption("Run on the laptop connected to the Uno. Close Arduino Serial Monitor before connecting.")
+    if serial is None:
+        st.error("Install pyserial in this Python environment, then restart Streamlit.")
+        return
+    try:
+        ports = [entry.device for entry in list_ports.comports()]
+    except OSError:
+        ports = []
+    if "COM6" in ports:
+        ports.remove("COM6")
+        ports.insert(0, "COM6")
+    if s.get("usb_port", "COM6") not in ports:
+        ports.insert(0, s.get("usb_port", "COM6"))
+    st.selectbox("Arduino port", ports, key="usb_port")
+    reader = s.get("usb_reader")
+    if reader is None:
+        if st.button("Connect Arduino", key="usb_connect"):
+            try:
+                s.usb_reader = UsbReadings(s.usb_port)
+                s.live_samples = []
+                s.live_sequence = 0
+            except (serial.SerialException, OSError, ValueError):
+                st.error("Could not open this port. Close Serial Monitor and other serial apps, check the port, then retry.")
+    elif st.button("Disconnect Arduino", key="usb_disconnect"):
+        reader.close()
+        del s["usb_reader"]
+        s.live_samples = []
+    st.checkbox("Soil probe connected to A0", key="soil_attached")
+    st.checkbox("Rain plate connected to A1", key="rain_attached")
+    st.caption("Enable these only for connected probes. Open analog inputs can show numbers.")
+
+
+@st.fragment(run_every=1)
+def live_monitor():
+    s = st.session_state
+    values = current_values()
+    reader = s.get("usb_reader")
+    if reader is None:
+        st.info("Choose your port and click Connect Arduino in the sidebar.")
+    elif reader.error:
+        st.error(reader.error)
+    elif reader.received_clock is None:
+        if time.monotonic() - reader.started_clock > 10:
+            st.warning("No valid AGRI-AI message yet. Confirm the full sketch is uploaded and the port is correct.")
+        else:
+            st.info("Connected · waiting for the Uno to restart and send readings…")
+    else:
+        age = time.monotonic() - reader.received_clock
+        if age > 10:
+            st.warning("Readings are stale. Check the USB cable and Arduino. Current values are hidden.")
+        else:
+            st.caption(f"Live USB · {reader.port} · last message {age:.0f}s ago")
+            if not reader.packet["dht_ok"]:
+                st.warning("DHT11 did not return a valid reading. Check its power and data connection.")
+        if reader.sequence != s.get("live_sequence", 0):
+            s.live_sequence = reader.sequence
+            samples = s.get("live_samples", [])
+            samples.append({"time": reader.received_at, "values": values.copy()})
+            s.live_samples = samples[-240:]
+    metric_cards(values, LIVE_READINGS)
+    st.caption("Tank level unavailable · soil and rain values are raw ADC readings, pending calibration.")
+    if reader and reader.packet:
+        st.caption("LCD adapter detected" if reader.packet["lcd_ok"] else "LCD adapter not detected at the sketch's checked addresses")
+        with st.expander("USB message"):
+            st.json(reader.packet)
+    with st.expander("Live reading trends"):
+        selection = st.selectbox("Live trend", list(LIVE_READINGS),
+                                 format_func=lambda k: LIVE_READINGS[k][0], key="live_trend")
+        samples = s.get("live_samples", [])
+        rows = [{"Sample": i + 1, "Reading": item["values"].get(selection)}
+                for i, item in enumerate(samples)]
+        if len(rows) > 1:
+            import pandas as pd
+            st.line_chart(pd.DataFrame(rows), x="Sample", y="Reading", height=180,
+                          color=LIVE_READINGS[selection][5])
+        else:
+            st.caption("The trend begins after two messages.")
+
+
+def live_dashboard(farm):
+    live_monitor()
+    if st.button("Explain these sensor readings", key="explain_live"):
+        st.session_state.pending = "Explain my current sensor readings. What is measured and what is still unavailable?"
+    if st.button("Ask about crop suitability", key="crop_live"):
+        st.session_state.pending = "Using my current sensor readings and farm details, which crops could suit my location and season? Ask for missing information."
+    st.caption("Crop suggestions also require region, season, soil and drainage. Add these in Farm details.")
+
+
+
 def main():
     st.set_page_config(page_title="AGRI-AI · Farm dashboard", page_icon="🌾", layout="wide")
     st.markdown(CSS, unsafe_allow_html=True)
@@ -536,23 +781,31 @@ def main():
     key = get_api_key()
     with st.sidebar:
         st.markdown('<div class="ag-brand"><span class="ag-mark">🌾</span>AGRI-AI</div>', unsafe_allow_html=True)
-        section = st.radio("Workspace", ["Dashboard", "Farm simulator", "Chat history"])
+        section = st.radio("Workspace", ["Dashboard", "Farm simulator", "Chat history"], key="workspace")
         st.divider()
+        usb_controls()
         with st.expander("Farm details"):
             st.text_input("District or region", key="field_region", max_chars=120)
             st.text_input("Growing season", key="field_season", max_chars=80)
             st.selectbox("Soil type", ("Unknown", "Loam", "Sandy loam", "Clay loam", "Clay", "Sand"), key="field_soil")
         st.selectbox("Microphone language", list(SPEECH_LANGS), key="language")
-        st.caption("DeepSeek key configured" if key else "Local demo · DeepSeek key not configured")
+        st.caption("DeepSeek key configured" if key else "DeepSeek key not configured · basic local replies")
         st.caption("Textbook file present" if PDF_PATH.is_file() else "Textbook not attached")
     farm = {"region": s.field_region or "Unknown", "season": s.field_season or "Unknown", "soil type": s.field_soil}
-    if section != "Farm simulator":
+    if using_live():
+        # Suppress the simulator's refill alert when hardware data is selected.
+        s.low_tank = False
+    elif section != "Farm simulator":
         record_readings(s.demo)
     title = {"Dashboard": "Farm dashboard", "Farm simulator": "Farm simulator", "Chat history": "Chat history"}[section]
+    source_text = "Live USB · Arduino Uno" if using_live() else "Demo mode · Simulated readings"
     st.markdown(f'<div class="ag-head"><div class="ag-kicker">AGRI-AI / Exhibition</div><h1>{title}</h1>'
-                '<div class="ag-note">Demo mode · Simulated readings · Hardware disconnected</div></div>', unsafe_allow_html=True)
+                f'<div class="ag-note">{source_text}</div></div>', unsafe_allow_html=True)
     if section == "Dashboard":
-        render_dashboard(s.demo, farm)
+        if using_live():
+            live_dashboard(farm)
+        else:
+            render_dashboard(s.demo, farm)
     elif section == "Farm simulator":
         simulator()
     else:
