@@ -3,3 +3,4 @@ openai
 PyMuPDF
 streamlit-mic-recorder
 SpeechRecognition
+pyserial
