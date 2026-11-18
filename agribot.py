@@ -1,13 +1,12 @@
 """AGRI-AI • school exhibition dashboard
 Run: python -m streamlit run agribot.py
 Install streamlit>=1.51 and pyserial. Run locally for USB.
-Required: Streamlit 1.51 or newer for browser voice controls. For PDF support
-restore pdf_knowledge.py with its dependencies, or install pypdf. Put
-agri_data_base.pdf beside this file. Configure DEEPSEEK_API_KEY in Streamlit
+Required: Streamlit 1.51 or newer for browser voice controls. For textbook PDFs install pypdf. Add textbook PDFs or page images in the sidebar. Configure DEEPSEEK_API_KEY in Streamlit
 secrets or the environment. The exhibition model image is embedded at the end.
 """
 import json
 import math
+import io
 import time
 import os
 from pathlib import Path
@@ -32,6 +31,35 @@ READINGS = {
 SPEECH_LANGS = {"English": "en-IN", "தமிழ்": "ta-IN", "हिन्दी": "hi-IN"}
 OKRA_URL = "https://agritech.tnau.ac.in/org_farm/orgfarm_bhendi_climate.html"
 PEA_URL = "https://agritech.tnau.ac.in/horticulture/horti_vegetables_peas.html"
+
+
+# District-focused crop knowledge. Water figures below are TNAU surface-irrigation
+# reference values, not sensor thresholds or daily irrigation instructions.
+SIVAGANGAI_CROPS = [
+    {"crop": "Paddy (rice)", "group": "Cereal", "local_evidence": "Major crop; wetland and rainfed rotations", "systems": "Wetland; rainfed", "water_mm": 1250, "water_note": "TNAU surface-irrigation reference; crop duration about 110 days"},
+    {"crop": "Black gram", "group": "Pulse", "local_evidence": "Major crop; paddy-blackgram rotation", "systems": "Rainfed; gardenland; wetland rotation", "water_mm": 280, "water_note": "TNAU surface-irrigation reference; crop duration about 65 days"},
+    {"crop": "Groundnut", "group": "Oilseed", "local_evidence": "Major crop; paddy-groundnut rotation", "systems": "Rainfed; gardenland", "water_mm": 510, "water_note": "TNAU surface-irrigation reference; crop duration about 105 days"},
+    {"crop": "Sesame (gingelly)", "group": "Oilseed", "local_evidence": "Major crop; paddy-sesame rotation", "systems": "Rainfed; gardenland", "water_mm": 150, "water_note": "TNAU surface-irrigation reference; crop duration about 85 days"},
+    {"crop": "Maize", "group": "Cereal", "local_evidence": "Listed for gardenland", "systems": "Gardenland", "water_mm": 500, "water_note": "TNAU surface-irrigation reference; crop duration about 100 days"},
+    {"crop": "Sorghum", "group": "Millet", "local_evidence": "District plan lists millets/cereals", "systems": "Rainfed/gardenland; confirm local season", "water_mm": 500, "water_note": "TNAU surface-irrigation reference; crop duration about 105 days"},
+    {"crop": "Finger millet (ragi)", "group": "Millet", "local_evidence": "District plan lists millets; confirm local block/season", "systems": "Rainfed/gardenland; confirm local season", "water_mm": 310, "water_note": "TNAU surface-irrigation reference; crop duration about 95 days"},
+    {"crop": "Sugarcane", "group": "Commercial", "local_evidence": "Listed for gardenland", "systems": "Gardenland", "water_mm": 2200, "water_note": "TNAU surface-irrigation reference; crop duration about 360 days"},
+    {"crop": "Cotton", "group": "Commercial", "local_evidence": "District agriculture plan lists cotton varieties", "systems": "Confirm soil, season and local extension advice", "water_mm": 600, "water_note": "TNAU surface-irrigation reference; crop duration about 165 days"},
+    {"crop": "Tomato", "group": "Vegetable", "local_evidence": "Rainfed and gardenland crop", "systems": "Rainfed; gardenland", "water_mm": None, "water_note": "No single district-wide water figure encoded"},
+    {"crop": "Chilli", "group": "Vegetable", "local_evidence": "Listed for gardenland", "systems": "Gardenland", "water_mm": None, "water_note": "No single district-wide water figure encoded"},
+    {"crop": "Brinjal", "group": "Vegetable", "local_evidence": "Listed for gardenland", "systems": "Gardenland", "water_mm": None, "water_note": "No single district-wide water figure encoded"},
+    {"crop": "Bhendi (okra)", "group": "Vegetable", "local_evidence": "Listed for gardenland", "systems": "Gardenland", "water_mm": None, "water_note": "No single district-wide water figure encoded"},
+    {"crop": "Mango", "group": "Fruit", "local_evidence": "Listed among district fruit crops", "systems": "Orchard", "water_mm": None, "water_note": "Tree age, season and irrigation method affect demand"},
+    {"crop": "Amla", "group": "Fruit", "local_evidence": "Listed among district fruit crops", "systems": "Orchard", "water_mm": None, "water_note": "Tree age, season and irrigation method affect demand"},
+    {"crop": "Sapota", "group": "Fruit", "local_evidence": "Listed among district fruit crops", "systems": "Orchard", "water_mm": None, "water_note": "Tree age, season and irrigation method affect demand"},
+    {"crop": "Guava", "group": "Fruit", "local_evidence": "Listed among district fruit crops", "systems": "Orchard", "water_mm": None, "water_note": "Tree age, season and irrigation method affect demand"},
+    {"crop": "Pomegranate", "group": "Fruit", "local_evidence": "Listed among district fruit crops", "systems": "Orchard", "water_mm": None, "water_note": "Tree age, season and irrigation method affect demand"},
+    {"crop": "Cashew", "group": "Tree crop", "local_evidence": "Listed among district crops", "systems": "Orchard", "water_mm": None, "water_note": "Tree age, soil and rainfall affect demand"},
+    {"crop": "Lime", "group": "Fruit", "local_evidence": "Listed for gardenland", "systems": "Orchard/gardenland", "water_mm": None, "water_note": "Tree age, season and irrigation method affect demand"},
+    {"crop": "Coconut", "group": "Plantation", "local_evidence": "Listed for gardenland", "systems": "Gardenland", "water_mm": None, "water_note": "No single district-wide water figure encoded"},
+    {"crop": "Senna", "group": "Medicinal crop", "local_evidence": "Listed among district crops", "systems": "Confirm local season and buyer/market", "water_mm": None, "water_note": "No single district-wide water figure encoded"},
+    {"crop": "Periwinkle", "group": "Medicinal crop", "local_evidence": "Listed among district crops", "systems": "Confirm local season and buyer/market", "water_mm": None, "water_note": "No single district-wide water figure encoded"},
+]
 
 system_instruction = """
 You are AGRI-AI, a friendly, intelligent, multilingual agricultural assistant specializing in traditional Indian natural farming, sustainable agriculture, soil health, smart composting, and modern agricultural science.
@@ -67,19 +95,25 @@ welcome_message = (
 )
 
 SENSOR_INSTRUCTION = """
-Use the current request's source field to distinguish manual demo data from
-live Arduino USB readings. Historical chat may refer to different sources or
-older values. Use only the current snapshot for current sensor claims.
+Use only the current request's source field to distinguish manual demo data from
+live Arduino USB readings. Historical chat may refer to older values.
 Null or unavailable means no fresh measurement. Do not invent missing values.
-Soil and rain are uncalibrated raw ADC values, not moisture percentages.
-The user confirms probe presence; software cannot detect detached analog probes.
-Rain-plate wetness cannot give rainfall quantity or tank level. Tank level is
-unavailable in the current physical model. DHT11 measures air, not soil temperature.
-Do not infer pH, EC, nutrients, disease or irrigation needs from raw readings.
-Crop suggestions need region, season, soil, drainage and climate over time.
-Ask for missing information. Explain assumptions and avoid suitability guarantees.
-You may answer general farming questions from general knowledge. Distinguish
-general guidance from textbook evidence, and cite PDF pages only when provided.
+The DHT11 measures air temperature and relative humidity, not soil temperature.
+The soil probe is a raw ADC value unless a user-calibrated dry/wet conversion is
+explicitly supplied. A calibrated percentage is an estimate for that probe and
+soil, not a universal crop threshold. Rain-plate raw values indicate surface
+wetness only; they are not rainfall in millimetres or tank level.
+The current physical model has no tank-level measurement unless an explicit
+water-level field is supplied by the Arduino.
+Do not infer pH, EC, nutrients, disease or exact irrigation need from these sensors.
+Use the Sivagangai crop database as local crop evidence. Water-mm figures are
+TNAU surface-irrigation references, not daily prescriptions or sensor thresholds.
+Do not turn seed germination temperatures into mature-crop air-temperature limits.
+There are no universal air-humidity or soil-moisture percentage thresholds for
+every crop. Crop suitability also depends on region, season, soil texture, drainage,
+variety, sowing date, crop stage, rainfall and water source. Ask for missing details.
+Do not guarantee a crop recommendation. Clearly distinguish local crop evidence,
+water references, textbook passages and general agricultural knowledge.
 """
 
 CSS = """
@@ -171,24 +205,156 @@ def simple_search(question, chunks, limit):
     return [c for weight, c in ranked if weight][:limit]
 
 
+def extract_uploaded_textbook(upload):
+    """Extract searchable page chunks from a PDF, image page, or plain-text file."""
+    name = upload.name
+    raw = upload.getvalue()
+    suffix = Path(name).suffix.lower()
+    chunks = []
+    if suffix == ".pdf":
+        try:
+            from pypdf import PdfReader
+        except ImportError as exc:
+            raise ValueError("Install pypdf to read PDF textbooks: pip install pypdf") from exc
+        reader = PdfReader(io.BytesIO(raw))
+        for page_no, page in enumerate(reader.pages, 1):
+            text = (page.extract_text() or "").strip()
+            if text:
+                words = text.split()
+                for start in range(0, len(words), 220):
+                    part = " ".join(words[start:start + 260])
+                    chunks.append({"source": name, "page": page_no, "text": part})
+        if not chunks:
+            raise ValueError("No selectable text was found in this PDF. If it is a scanned PDF, upload page images or use OCR-enabled software first.")
+    elif suffix in (".png", ".jpg", ".jpeg"):
+        try:
+            from PIL import Image
+            import pytesseract
+            image = Image.open(io.BytesIO(raw))
+            text = pytesseract.image_to_string(image, lang="eng+tam")
+        except ImportError as exc:
+            raise ValueError("Image-page OCR needs Pillow and pytesseract. Install them with: pip install pillow pytesseract. Tesseract OCR software must also be installed.") from exc
+        except Exception as exc:
+            raise ValueError("Could not read text from this image. Check OCR installation and image clarity.") from exc
+        if text.strip():
+            chunks.append({"source": name, "page": 1, "text": text.strip()})
+        else:
+            raise ValueError("No readable text was detected in this page image.")
+    elif suffix == ".txt":
+        text = raw.decode("utf-8", errors="replace").strip()
+        for start in range(0, len(text.split()), 260):
+            words = text.split()
+            chunks.append({"source": name, "page": 1, "text": " ".join(words[start:start + 300])})
+    else:
+        raise ValueError("Supported textbook formats: PDF, PNG, JPG, JPEG and TXT.")
+    return chunks
+
+
+def textbook_library_panel():
+    """Sidebar uploader: adds extracted textbook pages to this browser session."""
+    st.markdown("**Textbook library**")
+    uploads = st.file_uploader(
+        "Add textbook PDF or page images",
+        type=["pdf", "png", "jpg", "jpeg", "txt"],
+        accept_multiple_files=True,
+        key="textbook_uploads"
+    )
+    if st.button("Add pages to AGRI-AI", key="add_textbook_pages", disabled=not uploads):
+        existing = st.session_state.get("uploaded_textbook_chunks", [])
+        known = set(st.session_state.get("uploaded_textbook_files", []))
+        added_files, errors = [], []
+        for upload in uploads or []:
+            signature = (upload.name, len(upload.getvalue()))
+            if signature in known:
+                continue
+            try:
+                new_chunks = extract_uploaded_textbook(upload)
+                existing.extend(new_chunks)
+                known.add(signature)
+                added_files.append(upload.name)
+            except ValueError as exc:
+                errors.append(f"{upload.name}: {exc}")
+        st.session_state.uploaded_textbook_chunks = existing
+        st.session_state.uploaded_textbook_files = list(known)
+        if added_files:
+            st.success("Added: " + ", ".join(added_files))
+        for error in errors:
+            st.warning(error)
+    count = len(st.session_state.get("uploaded_textbook_chunks", []))
+    st.caption(f"{count} searchable page/chunk(s) in this session.")
+    if st.button("Clear uploaded textbook pages", key="clear_textbook_pages"):
+        st.session_state.uploaded_textbook_chunks = []
+        st.session_state.uploaded_textbook_files = []
+        st.rerun()
+
+
+def crop_database_context():
+    """Compact crop facts passed to DeepSeek as project data, not as sensor thresholds."""
+    return [
+        {
+            **{k: row[k] for k in ("crop", "group", "local_evidence", "systems", "water_mm", "water_note")},
+            "air_temperature_range_c": "Not encoded: use a verified crop-production guide and growth stage",
+            "air_relative_humidity_range_pct": "Not encoded: no universal crop cutoff",
+            "soil_moisture_target_pct": "Not encoded: requires calibration for this probe and soil",
+            "water_sensor_interpretation": "Water source/tank status only; not seasonal crop water requirement"
+        }
+        for row in SIVAGANGAI_CROPS
+    ]
+
+
+def crop_database_panel():
+    with st.expander("Sivagangai crop knowledge base"):
+        st.caption("Local crop evidence is from Sivagangai KVK/district crop lists. TNAU water figures are surface-irrigation references. Air-temperature, humidity and soil-moisture target bands are left unfilled where verified crop-specific values are not available; the bot must not invent them.")
+        st.dataframe(
+            [{"Crop": row["crop"], "Type": row["group"], "Local evidence": row["local_evidence"],
+              "Farming system": row["systems"],
+              "Air temperature range": "Use verified crop guide; not encoded",
+              "Air humidity range": "No universal cutoff encoded",
+              "Soil moisture target": "Calibrate probe for this soil",
+              "Water reference (mm)": str(row["water_mm"]) if row["water_mm"] is not None else "Not encoded",
+              "Water note": row["water_note"]} for row in SIVAGANGAI_CROPS],
+            width="stretch",
+            hide_index=True
+        )
+        st.caption("Water figures: TNAU Water Requirements of Agricultural Crops, surface-irrigation reference values.")
+
+
+
 def textbook_context(question, history):
-    if not PDF_PATH.is_file():
-        return "", ""
+    """Retrieve matching passages from the bundled PDF and session-uploaded pages."""
+    chunks = []
+    note_parts = []
+    if PDF_PATH.is_file():
+        try:
+            fixed_chunks, retrieve = get_pdf_chunks(str(PDF_PATH), PDF_PATH.stat().st_mtime_ns)
+            for item in fixed_chunks:
+                chunks.append({"page": item.get("page", "?"), "text": item.get("text", ""),
+                               "source": PDF_PATH.name})
+        except Exception:
+            note_parts.append("The bundled textbook PDF could not be searched.")
+    chunks.extend(st.session_state.get("uploaded_textbook_chunks", []))
+    if not chunks:
+        return "", "No textbook pages have been added yet."
     try:
-        chunks, retrieve = get_pdf_chunks(str(PDF_PATH), PDF_PATH.stat().st_mtime_ns)
-        matches = list(retrieve(question, chunks, limit=3))
+        matches = simple_search(question, chunks, limit=5)
         earlier_questions = [m["content"] for m in history if m["role"] == "user"]
-        earlier_replies = [m["content"] for m in history if m["role"] == "assistant"]
-        if earlier_questions and earlier_replies:
-            followup = f"{earlier_questions[-1]} {earlier_replies[-1]} {question}"
-            seen = {entry["page"] for entry in matches}
-            for entry in retrieve(followup, chunks, limit=4):
-                if entry["page"] not in seen:
-                    matches.append(entry)
-                    seen.add(entry["page"])
-        return "\n\n".join(f"[PDF p. {item['page']}]\n{item['text'][:2500]}" for item in matches[:4]), ""
+        if earlier_questions:
+            matches += simple_search(f"{earlier_questions[-1]} {question}", chunks, limit=2)
+        seen = set()
+        unique = []
+        for item in matches:
+            marker = (item.get("source"), item.get("page"), item.get("text", "")[:100])
+            if marker not in seen:
+                unique.append(item)
+                seen.add(marker)
+        passages = "\n\n".join(
+            f"[{item.get('source', 'Uploaded textbook')}, p. {item.get('page', '?')}]\n{item['text'][:2200]}"
+            for item in unique[:5] if item.get("text")
+        )
+        return passages, " · ".join(note_parts)
     except Exception:
-        return "", "The textbook could not be searched. Check the PDF and its reader."
+        return "", "The textbook pages could not be searched. Check the uploaded files."
+
 
 
 def crop_example(values, soil_type):
@@ -200,6 +366,7 @@ def crop_example(values, soil_type):
     return ("More information needed", "These settings do not match the two teaching examples. Ask the assistant about your region, season and soil.", "")
 
 
+
 def reading_summary(values):
     definitions = LIVE_READINGS if using_live() else READINGS
     parts = []
@@ -208,46 +375,71 @@ def reading_summary(values):
         text = "unavailable" if value is None else f"{value}{meta[1]}"
         parts.append(f"{meta[0]} {text}")
     if using_live():
-        parts.append("Tank level unavailable")
+        if values.get("tank") is not None:
+            parts.append(f"Water level {values['tank']}%")
+        if values.get("water_status"):
+            parts.append(f"Water status {values['water_status']}")
+        if values.get("tank") is None and not values.get("water_status"):
+            parts.append("Tank/water status not supplied")
     return ", ".join(parts)
 
 
+
+
 def demo_reply(question, values, soil_type):
-    # Local replies can report live readings without an API key.
+    """Useful local fallback even when the DeepSeek API key is not configured."""
+    terms = question.casefold().strip().strip(".!?,")
+    # Greetings do not depend on Arduino readings, so answer them even in Live USB mode.
+    if terms in {"hi", "hello", "hey", "good morning", "good afternoon", "good evening", "vanakkam"}:
+        return "Hello! Welcome to AGRI-AI. You can ask me about your sensor readings, soil conditions, water level or crops suitable for the Sivagangai region."
     if using_live():
-        text = "Live USB readings: " + reading_summary(values) + "."
+        summary = "Live USB readings: " + reading_summary(values) + "."
         if not any(value is not None for value in values.values()):
-            text = "No fresh sensor readings are available. Connect Arduino and check the USB messages."
-        return text + " For a farming explanation or crop recommendation, configure the DeepSeek key."
-    terms = question.casefold()
-    if any(word in terms for word in ("crop", "grow", "plant", "பயிர", "फसल")):
-        crop, detail, _ = crop_example(values, soil_type)
-        return f"Demo crop example: {crop}. {detail}"
+            return "No fresh sensor readings are available. Connect the Arduino and check the USB messages."
+        if any(word in terms for word in ("crop", "grow", "plant", "பயிர", "फसल", "suit")):
+            local = ", ".join(row["crop"] for row in SIVAGANGAI_CROPS[:9])
+            return (summary + f" Sivagangai database crop examples include {local}. "
+                    "This is a local crop list, not a final suitability ranking. "
+                    "Please add your soil type, sowing season, drainage and irrigation source. "
+                    "Configure DEEPSEEK_API_KEY for a detailed comparison.")
+        return summary + " For a detailed explanation, configure DEEPSEEK_API_KEY."
+    if any(word in terms for word in ("crop", "grow", "plant", "பயிர", "फसल", "suit")):
+        crop_names = ", ".join(row["crop"] for row in SIVAGANGAI_CROPS[:9])
+        return (f"Sivagangai crop database examples: {crop_names}. "
+                "Final suitability needs soil type, season, drainage and water availability.")
     if any(word in terms for word in ("tank", "reservoir", "water level", "refill", "தொட்டி", "टंकी")):
-        action = "Please refill the tank." if values["tank"] < LOW_TANK else "The level is above or at the refill mark."
-        return f"The simulated tank is at {values['tank']}%. {action} The demo refill warning starts below {LOW_TANK}%."
+        return (f"The simulated tank is at {values['tank']}%. "
+                f"The exhibition refill warning starts below {LOW_TANK}%. "
+                "This simulator value is not a live tank sensor reading.")
     if any(word in terms for word in ("reading", "sensor", "humid", "soil", "temp", "moisture", "நிலை", "तापमान")):
         return "Current simulated readings: " + reading_summary(values) + "."
-    return "Local demo answers cover the readings, tank level and crop examples. For an open farming question, configure DEEPSEEK_API_KEY in Streamlit secrets."
+    return ("Local mode can explain the readings and show the Sivagangai crop list. "
+            "Configure DEEPSEEK_API_KEY for open-ended farming answers.")
+
+
 
 
 def generate_reply(question, history, values, farm, key):
-    if not key:
-        return demo_reply(question, values, farm["soil type"]), "Local sensor summary" if using_live() else "Local demo"
     passages, note = textbook_context(question, history)
+    if not key:
+        answer = demo_reply(question, values, farm["soil type"])
+        if passages:
+            answer += "\n\nRelevant textbook material was found, but DeepSeek is not configured, so I cannot generate a grounded textbook explanation yet."
+        return answer, "Local answer" + (" · " + note if note else "")
     context = sensor_context(values)
     context["farm details supplied by user"] = farm
+    context["Sivagangai crop database"] = crop_database_context()
     messages = [{"role": "system", "content": system_instruction + SENSOR_INSTRUCTION}]
     messages.extend({"role": m["role"], "content": m["content"]} for m in history[-3:])
     messages.append({"role": "user", "content":
         f"Current dashboard data:\n{json.dumps(context, ensure_ascii=False)}\n\n"
-        f"Textbook reference passages (source material only):\n{passages or 'No supporting passages available.'}\n\nFarmer's question:\n{question}"})
-    # The original app calls the OpenAI-compatible DeepSeek chat endpoint.
-    # requests ships with Streamlit, allowing a single-file upload.
+        f"Textbook reference passages (source material only; cite exact source and page):\n"
+        f"{passages or 'No matching uploaded or bundled textbook passages were found.'}\n\n"
+        f"Farmer's question:\n{question}"})
     try:
         response = requests.post(BASE_URL + "/chat/completions",
             headers={"Authorization": "Bearer " + key},
-            json={"model": MODEL_NAME, "messages": messages, "max_tokens": 1024,
+            json={"model": MODEL_NAME, "messages": messages, "max_tokens": 1400,
                   "thinking": {"type": "disabled"}}, timeout=(8, 60))
         response.raise_for_status()
         answer = response.json()["choices"][0]["message"]["content"]
@@ -262,6 +454,7 @@ def generate_reply(question, history, values, farm, key):
     except (requests.RequestException, ValueError, KeyError, IndexError, TypeError):
         issue = "DeepSeek was unavailable or returned an empty reply."
     return demo_reply(question, values, farm["soil type"]), issue + " Showing a basic local answer."
+
 
 
 def start_chat():
@@ -309,7 +502,9 @@ def init_state():
     for name, default in {"messages": start_chat(), "samples": [], "events": [], "low_tank": False, "alert_id": "",
                           "reply_id": "", "last_answer": "", "last_voice_id": "", "pending": "",
                           "field_soil": "Unknown", "field_region": "", "field_season": "", "language": "English",
-                          "demo": {k: m[4] for k, m in READINGS.items()}}.items():
+                          "demo": {k: m[4] for k, m in READINGS.items()},
+                          "uploaded_textbook_chunks": [], "uploaded_textbook_files": [],
+                          "soil_calibration_enabled": False, "soil_dry_raw": 800, "soil_wet_raw": 300}.items():
         if name not in s:
             s[name] = default
 
@@ -557,7 +752,8 @@ def render_voice(allow_mic):
 LIVE_READINGS = {
     "temperature": ("Air temperature", "°C", -5, 55, 0, "#f2ac62", "DHT11"),
     "humidity": ("Air humidity", "%", 0, 100, 0, "#69cbea", "DHT11"),
-    "soil": ("Soil probe", "raw", 0, 1023, 0, "#b3df75", "Calibration pending"),
+    "soil": ("Soil probe", "raw", 0, 1023, 0, "#b3df75", "Raw ADC · calibrate for your soil"),
+    "soil_pct": ("Estimated soil moisture", "%", 0, 100, 0, "#b3df75", "Shown only after user calibration"),
     "rain": ("Rain plate", "raw", 0, 1023, 0, "#91a8ff", "Surface wetness · calibration pending"),
 }
 
@@ -616,34 +812,75 @@ class UsbReadings:
             self.connection.close()
 
 
+
+
 def validate_packet(packet):
     if not isinstance(packet, dict) or packet.get("schema") != "agri-ai-v1":
         return None
-    raw_fields = ("soil_raw", "rain_raw")
-    for field in raw_fields:
+    # Legacy sketches send raw ADC values; newer sketches may send calibrated
+    # moisture or a water-level/status field. Both formats are accepted.
+    for field in ("soil_raw", "rain_raw"):
         value = packet.get(field)
-        if type(value) is not int or not 0 <= value <= 1023:
+        if value is not None and (type(value) is not int or not 0 <= value <= 1023):
             return None
-    for field, low, high in (("temperature_c", -40, 80), ("humidity_pct", 0, 100)):
+    for field, low, high in (
+        ("temperature_c", -40, 80), ("humidity_pct", 0, 100),
+        ("soil_moisture_pct", 0, 100), ("water_level_pct", 0, 100)
+    ):
         value = packet.get(field)
         if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or not low <= value <= high):
             return None
     if type(packet.get("dht_ok")) is not bool or type(packet.get("lcd_ok")) is not bool:
         return None
-    return {field: packet.get(field) for field in
-            ("schema", "uptime_ms", "temperature_c", "humidity_pct",
-             "soil_raw", "rain_raw", "dht_ok", "lcd_ok")}
+    water_status = packet.get("water_status")
+    if water_status is not None and (not isinstance(water_status, str) or len(water_status) > 24):
+        return None
+    rain_wet = packet.get("rain_wet")
+    if rain_wet is not None and type(rain_wet) is not bool:
+        return None
+    if packet.get("soil_raw") is None and packet.get("soil_moisture_pct") is None:
+        # A packet may omit soil only when the soil sensor is not fitted.
+        pass
+    return {
+        "schema": "agri-ai-v1", "uptime_ms": packet.get("uptime_ms"),
+        "temperature_c": packet.get("temperature_c"), "humidity_pct": packet.get("humidity_pct"),
+        "soil_raw": packet.get("soil_raw"), "rain_raw": packet.get("rain_raw"),
+        "soil_moisture_pct": packet.get("soil_moisture_pct"),
+        "water_level_pct": packet.get("water_level_pct"),
+        "water_status": water_status, "rain_wet": rain_wet,
+        "dht_ok": packet.get("dht_ok"), "lcd_ok": packet.get("lcd_ok")
+    }
+
+
 
 
 def using_live():
     return st.session_state.get("data_source", "Live USB") == "Live USB" and st.session_state.get("workspace") != "Farm simulator"
 
 
+
+def calibrated_soil_percent(raw):
+    """Map raw ADC between user-measured dry and wet calibration points."""
+    s = st.session_state
+    if raw is None or not s.get("soil_calibration_enabled", False):
+        return None
+    dry = int(s.get("soil_dry_raw", 800))
+    wet = int(s.get("soil_wet_raw", 300))
+    if dry == wet:
+        return None
+    # Soil probe ADC may rise or fall with moisture; use the two measured endpoints.
+    pct = 100.0 * (raw - dry) / (wet - dry)
+    return round(max(0.0, min(100.0, pct)), 1)
+
+
+
+
 def current_values():
     s = st.session_state
     if not using_live():
         return s.demo.copy()
-    values = {"temperature": None, "humidity": None, "soil": None, "rain": None, "tank": None}
+    values = {"temperature": None, "humidity": None, "soil": None, "soil_pct": None,
+              "rain": None, "tank": None, "water_status": None}
     reader = s.get("usb_reader")
     if reader is None:
         return values
@@ -654,11 +891,21 @@ def current_values():
     if packet["dht_ok"]:
         values["temperature"] = packet["temperature_c"]
         values["humidity"] = packet["humidity_pct"]
-    if s.get("soil_attached", False):
+    if s.get("soil_attached", False) and packet.get("soil_raw") is not None:
         values["soil"] = packet["soil_raw"]
-    if s.get("rain_attached", False):
+        values["soil_pct"] = packet.get("soil_moisture_pct")
+        if values["soil_pct"] is None:
+            values["soil_pct"] = calibrated_soil_percent(packet["soil_raw"])
+    elif packet.get("soil_moisture_pct") is not None:
+        values["soil_pct"] = packet["soil_moisture_pct"]
+    if s.get("rain_attached", False) and packet.get("rain_raw") is not None:
         values["rain"] = packet["rain_raw"]
+    if packet.get("water_level_pct") is not None:
+        values["tank"] = packet["water_level_pct"]
+    values["water_status"] = packet.get("water_status")
     return values
+
+
 
 
 def sensor_context(values):
@@ -671,8 +918,13 @@ def sensor_context(values):
             "readings": reading_summary(values),
             "soil probe attached (user confirmation)": st.session_state.get("soil_attached", False),
             "rain plate attached (user confirmation)": st.session_state.get("rain_attached", False),
-            "tank level": "unavailable; no tank level sensor",
-            "soil and rain raw limits": "0 to 1023; uncalibrated; not a percentage",
+            "tank level (%)": values.get("tank"),
+            "water status": values.get("water_status") or "not supplied",
+            "soil raw limits": "0 to 1023; raw ADC unless calibrated",
+            "calibrated soil moisture estimate (%)": values.get("soil_pct"),
+            "soil calibration enabled": st.session_state.get("soil_calibration_enabled", False),
+            "soil dry/wet calibration points": [st.session_state.get("soil_dry_raw", 800), st.session_state.get("soil_wet_raw", 300)],
+            "rain plate meaning": "raw surface wetness only; not rainfall quantity",
             "fresh": any(value is not None for value in values.values())}
 
 
@@ -688,10 +940,13 @@ def usb_controls():
     if serial is None:
         st.error("Install pyserial in this Python environment, then restart Streamlit.")
         return
+    try:
+        ports = [entry.device for entry in list_ports.comports()]
+    except OSError:
+        ports = []
     ports = ["COM4", "COM5", "COM6"]
 
     st.selectbox("Arduino port", ports, key="usb_port")
-
     reader = s.get("usb_reader")
     if reader is None:
         if st.button("Connect Arduino", key="usb_connect"):
@@ -711,6 +966,7 @@ def usb_controls():
 
 
 @st.fragment(run_every=1)
+
 def live_monitor():
     s = st.session_state
     values = current_values()
@@ -738,7 +994,11 @@ def live_monitor():
             samples.append({"time": reader.received_at, "values": values.copy()})
             s.live_samples = samples[-240:]
     metric_cards(values, LIVE_READINGS)
-    st.caption("Tank level unavailable · soil and rain values are raw ADC readings, pending calibration.")
+    if values.get("water_status"):
+        st.info(f"Water sensor status: {values['water_status']}")
+    elif values.get("tank") is not None:
+        st.info(f"Water level reading: {values['tank']}%")
+    st.caption("Rain plate raw readings indicate surface wetness, not rainfall in mm. Water status/level appears only if the Arduino packet sends water_status or water_level_pct.")
     if reader and reader.packet:
         st.caption("LCD adapter detected" if reader.packet["lcd_ok"] else "LCD adapter not detected at the sketch's checked addresses")
         with st.expander("USB message"):
@@ -755,6 +1015,7 @@ def live_monitor():
                           color=LIVE_READINGS[selection][5])
         else:
             st.caption("The trend begins after two messages.")
+
 
 
 def live_dashboard(farm):
@@ -778,13 +1039,22 @@ def main():
         section = st.radio("Workspace", ["Dashboard", "Farm simulator", "Chat history"], key="workspace")
         st.divider()
         usb_controls()
+        with st.expander("Add textbook pages"):
+            textbook_library_panel()
         with st.expander("Farm details"):
             st.text_input("District or region", key="field_region", max_chars=120)
             st.text_input("Growing season", key="field_season", max_chars=80)
             st.selectbox("Soil type", ("Unknown", "Loam", "Sandy loam", "Clay loam", "Clay", "Sand"), key="field_soil")
+            st.markdown("**Optional soil-probe calibration**")
+            st.checkbox("Use my calibrated soil-moisture estimate", key="soil_calibration_enabled")
+            st.number_input("Raw reading in dry soil", min_value=0, max_value=1023, key="soil_dry_raw")
+            st.number_input("Raw reading in wet soil", min_value=0, max_value=1023, key="soil_wet_raw")
+            st.caption("The 800/300 values are placeholders only. Measure your own probe in your own soil before enabling calibration.")
         st.selectbox("Microphone language", list(SPEECH_LANGS), key="language")
         st.caption("DeepSeek key configured" if key else "DeepSeek key not configured · basic local replies")
-        st.caption("Textbook file present" if PDF_PATH.is_file() else "Textbook not attached")
+        textbook_count = len(s.get("uploaded_textbook_chunks", []))
+        bundled = "bundled PDF available" if PDF_PATH.is_file() else "no bundled PDF"
+        st.caption(f"Textbooks: {bundled} · {textbook_count} uploaded chunks")
     farm = {"region": s.field_region or "Unknown", "season": s.field_season or "Unknown", "soil type": s.field_soil}
     if using_live():
         # Suppress the simulator's refill alert when hardware data is selected.
@@ -796,6 +1066,7 @@ def main():
     st.markdown(f'<div class="ag-head"><div class="ag-kicker">AGRI-AI / Exhibition</div><h1>{title}</h1>'
                 f'<div class="ag-note">{source_text}</div></div>', unsafe_allow_html=True)
     if section == "Dashboard":
+        crop_database_panel()
         if using_live():
             live_dashboard(farm)
         else:
@@ -804,19 +1075,19 @@ def main():
         simulator()
     else:
         history_panel()
-    if section != "Farm simulator":
-        st.subheader("Ask AGRI-AI" if section == "Dashboard" else "Conversation")
-        with st.container():
-            typed = st.chat_input("Type a farming question…", max_chars=4000)
-    else:
-        typed = None
-    question = typed or s.pending
-    if question:
+    if s.pending:
+        question = s.pending
         s.pending = ""
         handle_question(question, farm, key)
-    render_voice(section != "Farm simulator")
     if section != "Farm simulator":
+        st.subheader("Ask AGRI-AI" if section == "Dashboard" else "Conversation")
         render_messages()
+        with st.container():
+            typed = st.chat_input("Type a farming question…", max_chars=4000)
+        if typed:
+            handle_question(typed, farm, key)
+            st.rerun()
+    render_voice(section != "Farm simulator")
 
 
 # Compressed copy of the supplied exhibition design reference (single-file upload).
