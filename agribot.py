@@ -688,16 +688,10 @@ def usb_controls():
     if serial is None:
         st.error("Install pyserial in this Python environment, then restart Streamlit.")
         return
-    try:
-        ports = [entry.device for entry in list_ports.comports()]
-    except OSError:
-        ports = []
-    if "COM6" in ports:
-        ports.remove("COM6")
-        ports.insert(0, "COM6")
-    if s.get("usb_port", "COM6") not in ports:
-        ports.insert(0, s.get("usb_port", "COM6"))
+    ports = ["COM4", "COM5", "COM6"]
+
     st.selectbox("Arduino port", ports, key="usb_port")
+
     reader = s.get("usb_reader")
     if reader is None:
         if st.button("Connect Arduino", key="usb_connect"):
