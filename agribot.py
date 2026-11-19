@@ -940,13 +940,26 @@ def usb_controls():
     if serial is None:
         st.error("Install pyserial in this Python environment, then restart Streamlit.")
         return
-    try:
-        ports = [entry.device for entry in list_ports.comports()]
-    except OSError:
-        ports = []
-    ports = ["COM4", "COM5", "COM6"]
 
+    # Detect every serial port currently reported by Windows (or the host OS).
+    try:
+        ports = sorted({entry.device for entry in list_ports.comports()}, key=str.casefold)
+    except Exception:
+        ports = []
+
+    st.button("Refresh available ports", key="refresh_usb_ports")
+    # The button causes a Streamlit rerun, so the port scan above is repeated.
+    if not ports:
+        st.warning("No serial ports detected. Connect the Arduino, check its USB cable and driver, then click Refresh available ports.")
+        st.checkbox("Soil probe connected to A0", key="soil_attached")
+        st.checkbox("Rain plate connected to A1", key="rain_attached")
+        return
+
+    # Keep the widget's selected value valid when devices are unplugged/replugged.
+    if s.get("usb_port") not in ports:
+        s["usb_port"] = ports[0]
     st.selectbox("Arduino port", ports, key="usb_port")
+
     reader = s.get("usb_reader")
     if reader is None:
         if st.button("Connect Arduino", key="usb_connect"):
@@ -954,8 +967,8 @@ def usb_controls():
                 s.usb_reader = UsbReadings(s.usb_port)
                 s.live_samples = []
                 s.live_sequence = 0
-            except (serial.SerialException, OSError, ValueError):
-                st.error("Could not open this port. Close Serial Monitor and other serial apps, check the port, then retry.")
+            except (serial.SerialException, OSError, ValueError) as exc:
+                st.error(f"Could not open {s.usb_port}: {exc}. Close Arduino Serial Monitor and other serial apps, check the cable/driver, then retry.")
     elif st.button("Disconnect Arduino", key="usb_disconnect"):
         reader.close()
         del s["usb_reader"]

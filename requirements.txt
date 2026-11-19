@@ -1,6 +1,8 @@
-streamlit
+streamlit>=1.51
 openai
 PyMuPDF
+pypdf
+requests
 streamlit-mic-recorder
 SpeechRecognition
 pyserial
